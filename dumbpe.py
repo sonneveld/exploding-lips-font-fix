@@ -310,6 +310,13 @@ Relocations
 Reference: https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#the-reloc-section-image-only
 '''
 
+IMAGE_REL_BASED_ABSOLUTE=0 # The base relocation is skipped. This type can be used to pad a block.
+IMAGE_REL_BASED_HIGH=1 # The base relocation adds the high 16 bits of the difference to the 16-bit field at offset. The 16-bit field represents the high value of a 32-bit word.
+IMAGE_REL_BASED_LOW=2 # The base relocation adds the low 16 bits of the difference to the 16-bit field at offset. The 16-bit field represents the low half of a 32-bit word.
+IMAGE_REL_BASED_HIGHLOW=3 # The base relocation applies all 32 bits of the difference to the 32-bit field at offset.
+IMAGE_REL_BASED_HIGHADJ=4 # The base relocation adds the high 16 bits of the difference to the 16-bit field at offset. The 16-bit field represents the high value of a 32-bit word. The low 16 bits of the 32-bit value are stored in the 16-bit word that follows this base relocation. This means that this base relocation occupies two slots.
+IMAGE_REL_BASED_DIR64=10 # The base relocation applies the difference to the 64-bit field at offset.
+
 def parse_relocations(buffer:bytes|bytearray, offset:int, size:int):
 
     offset_end = offset + size
@@ -327,9 +334,9 @@ def parse_relocations(buffer:bytes|bytearray, offset:int, size:int):
             entry_type = (entry_b >> 12) & 0xF
             entry_offset = entry_b & 0xFFF
             # print(' ', hex(entry_offset), '->', hex(PageRVA + entry_offset), entry_type)
-            if entry_type == 3:
+            if entry_type == IMAGE_REL_BASED_HIGHLOW:
                 yield PageRVA + entry_offset
-            elif entry_type == 0:
+            elif entry_type == IMAGE_REL_BASED_ABSOLUTE:
                 pass
             else:
                 raise ValueError(f"Unsupported reloc type: {entry_type}")
@@ -373,7 +380,7 @@ def encode_relocations(relocations:list[int]) -> bytearray:
         result.extend( struct.pack("<II",page_rva, block_sz+padding_sz) )
         for offset in offsets:
             # we currently only support type 3, see parse_relocations
-            value = (3 << 12) | offset
+            value = (IMAGE_REL_BASED_HIGHLOW << 12) | offset
             result.extend( struct.pack("<H", value))
         result.extend(b'\x00'*padding_sz)
 
