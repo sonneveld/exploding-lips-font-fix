@@ -1,0 +1,12 @@
+[project]
+name = "exploding-lips-font-fix"
+version = "0.1.0"
+requires-python = ">=3.14"
+dependencies = [
+    "blake3>=1.0.9",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
