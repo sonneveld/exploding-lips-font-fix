@@ -447,8 +447,12 @@ class PeFile:
         return result
 
     def tofile(self, f):
-        self.flush_relocations()
+        self.flush_all()
         f.write(self.exedata)
+
+    def flush_all(self):
+        self.flush_relocations()
+        self.flush_headers()
 
 
     def flush_headers(self):
@@ -642,6 +646,42 @@ class PeFile:
                 assert raw_offset < s.mSizeOfRawData
                 return s.mPointerToRawData + raw_offset
         raise ValueError(f"Could not resolve logical file address from virtual address 0x{vaddr:08x}")
+
+
+# Based on LLD's Writer:writePEChecksum https://github.com/llvm/llvm-project/blob/main/lld/COFF/Writer.cpp#L735
+def update_pe_checksum(pefile:PeFile):
+
+    # rather than skipping checksum below, just set to 0 to begin with.
+    pefile.pe32_opt_header.mCheckSum = 0
+    pefile.flush_all()
+
+    _sum = 0
+    count = len(pefile.exedata)
+    addr = 0
+
+    # The PE checksum algorithm, implemented as suggested in RFC1071
+    while count > 1:
+        _sum += struct.unpack_from("<H", pefile.exedata, addr)[0]
+        addr += 2
+        count -= 2
+
+    # Add left-over byte, if any
+    if count > 0:
+        _sum += struct.unpack_from("<B", pefile.exedata, addr)[0]
+        count -= 1
+
+    assert count == 0
+
+    # Fold 32-bit sum to 16 bits
+    while _sum >> 16:
+        _sum = (_sum & 0xffff) + (_sum >> 16);
+
+    # finally add file size to checksum
+    _sum += len(pefile.exedata)
+
+    pefile.pe32_opt_header.mCheckSum = _sum
+    pefile.flush_headers()
+
 
 
 if __name__ == "__main__":

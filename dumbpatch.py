@@ -123,6 +123,7 @@ def patchit(OUT_PATH):
     for coffset in font_offsets:
         set_code(pefile, coffset, new_offset_b, [0,])
 
+    dumbpe.update_pe_checksum(pefile)
 
     with open(OUT_PATH, 'wb')  as f:
         pefile.tofile(f)
