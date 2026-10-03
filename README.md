@@ -7,3 +7,7 @@ This fix just adds a new section to the executable with a copy of the character 
 and replaces any references to the VGA BIOS with references to the new section.
 
 Exploding Lips can be found here: https://archive.org/details/exploding-lips-full
+
+![Exploding Lips screenshot](img/lips.png)
+
+Font grabbed from here: https://github.com/spacerace/romfont/
