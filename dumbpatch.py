@@ -55,7 +55,7 @@ def nasm(asmfile):
 
 
 
-def set_code(pefile, coffset, cbuf, relocs=None):
+def set_code(pefile:dumbpe.PeFile, coffset:int, cbuf:bytes|bytearray, relocs:list[int]|None=None):
     if relocs is None:
         relocs = []
 

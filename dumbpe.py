@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 from typing import Self
 
 
+PAGE_SIZE_X86 = 0x1000
+
 IMAGE_DOS_SIGNATURE = 0x5A4D # MZ
 IMAGE_NT_SIGNATURE = 0x00004550 # PE
 
@@ -114,11 +116,16 @@ class Pe32ImageDataDirectory:
     def size(cls) -> int:
         return PE32OPTDIR_STRUCT.size
 
+    def to_buffer(self, buffer, offset):
+        values = [
+            self.VirtualAddress,
+            self.Size,
+        ]
+        PE32OPTDIR_STRUCT.pack_into(buffer, offset, *values)
+
 
 IMAGE_NT_OPTIONAL_HDR_PE32_MAGIC = 0x10b
 IMAGE_NT_OPTIONAL_HDR_PE32_PLUS_MAGIC = 0x20b
-
-
 
 IMAGE_SUBSYSTEM_UNKNOWN     = 0 # Unknown subsystem.
 IMAGE_SUBSYSTEM_NATIVE      = 1 # Image doesn't require a subsystem.
@@ -226,6 +233,12 @@ class Pe32OptionalHeader:
             self.mNumberOfRvaAndSizes,
         ]
         PE32OPTHEAD_STRUCT.pack_into(buffer, offset, *values)
+        offset += PE32OPTHEAD_STRUCT.size
+        assert len(self.dirValues) == self.mNumberOfRvaAndSizes
+        for dv in self.dirValues:
+            dv.to_buffer(buffer, offset)
+            offset += Pe32ImageDataDirectory.size()
+
 
 
 '''
@@ -292,73 +305,83 @@ class SectionHeader:
         SECTHEAD_STRUCT.pack_into(buffer, offset, *values)
 
 
-def parse_relocations(buffer, offset):
+'''
+Relocations
+Reference: https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#the-reloc-section-image-only
+'''
 
-    while True:
-        # print("-")
-        VirtualAddress, SizeOfBlock = struct.unpack_from("<II", buffer, offset)
-        # print(hex(VirtualAddress), hex(SizeOfBlock))
-        nextblock_offset = offset+SizeOfBlock
+def parse_relocations(buffer:bytes|bytearray, offset:int, size:int):
+
+    offset_end = offset + size
+
+    while offset < offset_end:
+        PageRVA, BlockSize = struct.unpack_from("<II", buffer, offset)
+        nextblock_offset = offset+BlockSize
         offset += 8
 
-        if VirtualAddress == 0:
-            break
-
-        SizeOfBlock -= 8
-        while SizeOfBlock:
+        BlockSize -= 8  # block size includes the header
+        while BlockSize:
             entry_b, = struct.unpack_from("<H", buffer, offset)
             offset += 2
-            SizeOfBlock -= 2
+            BlockSize -= 2
             entry_type = (entry_b >> 12) & 0xF
             entry_offset = entry_b & 0xFFF
-            # if entry_type == 0:
-                # print(entry_offset)
-            if entry_type != 0:
-                assert entry_type == 3
-                yield VirtualAddress + entry_offset
-                # print('et', entry_type)
-            # print(' ', hex(entry_offset), '->', hex(VirtualAddress + entry_offset), entry_type)
+            # print(' ', hex(entry_offset), '->', hex(PageRVA + entry_offset), entry_type)
+            if entry_type == 3:
+                yield PageRVA + entry_offset
+            elif entry_type == 0:
+                pass
+            else:
+                raise ValueError(f"Unsupported reloc type: {entry_type}")
 
         assert offset == nextblock_offset
         offset = nextblock_offset
-        
 
 
-def encode_relocations(relocations):
+
+def encode_relocations(relocations:list[int]) -> bytearray:
+
+    '''
+    encodes relocatiosn into a byte array. doesn't check if it fits in any preexisting lengths.
+    '''
 
     result = bytearray()
 
     pages = defaultdict(list)
 
-    for address in relocations:
-        page_idx, page_offset = divmod(address, 0x1000)
-        page_address = page_idx*0x1000
-        pages[page_address].append(page_offset)
+    for reloc_rva in relocations:
+        page_idx, page_offset = divmod(reloc_rva, PAGE_SIZE_X86)
+        page_rva = page_idx*PAGE_SIZE_X86
+        pages[page_rva].append(page_offset)
 
 
-    for page_address in sorted(pages.keys()):
+    for page_rva in sorted(pages.keys()):
 
+        # Each block must start on a 32-bit boundary.
         assert len(result) % 4 == 0
 
-        offsets = pages[page_address]
+        len_start = len(result)
+
+        # figure out lengths ahead of time since we need to write block header first
+        offsets = pages[page_rva]
         block_sz = 4 + 4 + 2*len(offsets)
         padding_sz = 0
         _,remaining = divmod(block_sz, 4)
         if remaining != 0:
             padding_sz += 4-remaining
 
-        result.extend( struct.pack("<II",page_address, block_sz+padding_sz) )
+        result.extend( struct.pack("<II",page_rva, block_sz+padding_sz) )
         for offset in offsets:
+            # we currently only support type 3, see parse_relocations
             value = (3 << 12) | offset
             result.extend( struct.pack("<H", value))
         result.extend(b'\x00'*padding_sz)
 
-    # result.extend(b'\x00' * (wanted_size-len(result)))
-    # assert len(result) == wanted_size
+        len_end = len(result)
 
-    return result 
+        assert len_end-len_start == block_sz+padding_sz
 
-
+    return result
 
 
 
@@ -372,8 +395,7 @@ class PeFile:
     pe32_opt_header: Pe32OptionalHeader
     sections_lfa : int
     sections: list[SectionHeader]
-    reloc_s: SectionHeader
-    relocations: list[int]
+    relocations: list[int]|None = None
 
 
     @classmethod
@@ -401,64 +423,91 @@ class PeFile:
         # print(pe32_opt_header)
 
         sections_lfa = lfa
-        reloc_s = None
         sections = []
-        for i in range(pe_header.mNumberOfSections):
+        for _ in range(pe_header.mNumberOfSections):
             s = SectionHeader.from_buffer(exedata, lfa, pe32_opt_header)
             lfa += SectionHeader.size()
-            if s.mName == b'.reloc\x00\x00':
-                reloc_s = s
             sections.append(s)
-        assert reloc_s is not None
 
-        relocations = list(parse_relocations(exedata, reloc_s.mPointerToRawData))
+        result = cls(exedata, pe_header_lfa, pe_header, pe32_opt_header_lfa, pe32_opt_header, sections_lfa, sections)
 
-        return cls(exedata, pe_header_lfa, pe_header, pe32_opt_header_lfa, pe32_opt_header, sections_lfa, sections, reloc_s, relocations)
+        if result.pe32_opt_header.dirValues[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress != 0:
+            relocations_lfa = result.lfa_from_vaddr(result.pe32_opt_header.mImageBase + result.pe32_opt_header.dirValues[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress)
+            relocations_size = result.pe32_opt_header.dirValues[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size
+            relocations = list(parse_relocations(exedata, relocations_lfa, relocations_size))
+            result.relocations = relocations
+
+        return result
 
     def tofile(self, f):
-        self.update_reloc()
+        self.flush_relocations()
         f.write(self.exedata)
 
 
-    def update_reloc(self):
+    def flush_headers(self):
+        self.pe_header.to_buffer(self.exedata, self.pe_header_lfa)
+        self.pe32_opt_header.to_buffer(self.exedata, self.pe32_opt_header_lfa)
+
+
+    def flush_relocations(self):
+        if self.relocations is None:
+            return
         new_relocations_b = encode_relocations(self.relocations)
-        assert len(new_relocations_b) <= self.reloc_s.mSizeOfRawData
+
+        # Figure out what the relocation section is based on the directory.
+        # (we could look at the name but windows will only use it if it's referenced from the dir)
+        # we need the section instead of just the directory pointer, so we can figure
+        # out how much extra space is left.
+        reloc_s : SectionHeader|None = None
+        for s in self.sections:
+            if s.mVirtualAddress == self.pe32_opt_header.dirValues[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress:
+                reloc_s = s
+                break
+        assert reloc_s is not None
+
+        # check that we can fit the new relocations into the original space. the way
+        # that sections work out, there's usually some padding.
+        assert len(new_relocations_b) <= reloc_s.mSizeOfRawData
 
         # clear it first
-        self.exedata[self.reloc_s.mPointerToRawData:self.reloc_s.mPointerToRawData+self.reloc_s.mSizeOfRawData] = b'\x00'*self.reloc_s.mSizeOfRawData
+        self.exedata[reloc_s.mPointerToRawData:reloc_s.mPointerToRawData+reloc_s.mSizeOfRawData] = b'\x00'*reloc_s.mSizeOfRawData
 
-        self.exedata[self.reloc_s.mPointerToRawData:self.reloc_s.mPointerToRawData+len(new_relocations_b)] = new_relocations_b
+        self.exedata[reloc_s.mPointerToRawData:reloc_s.mPointerToRawData+len(new_relocations_b)] = new_relocations_b
 
-        reloc_dir_size_offset = self.pe32_opt_header_lfa + PE32OPTHEAD_STRUCT.size + PE32OPTDIR_STRUCT.size*IMAGE_DIRECTORY_ENTRY_BASERELOC
+        # the optional header's directory will tell us exactly how big the relocation
+        # table is. It should be less than or equal to the len of raw data.
+        self.pe32_opt_header.dirValues[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size = len(new_relocations_b)
 
-        struct.pack_into("<I", self.exedata, reloc_dir_size_offset+4, len(new_relocations_b))
+        self.flush_headers()
 
+    def clear_relocs(self, start_vaddr:int, end_vaddr:int):
+        assert self.relocations is not None
 
-    def clear_relocs(self, start_offset, end_offset):
+        assert end_vaddr >= start_vaddr
+        assert start_vaddr >= self.pe32_opt_header.mImageBase
+        assert end_vaddr >= self.pe32_opt_header.mImageBase
+        start_rva = start_vaddr - self.pe32_opt_header.mImageBase
+        end_rva = end_vaddr - self.pe32_opt_header.mImageBase
 
-        assert start_offset >= self.pe32_opt_header.mImageBase
-        assert end_offset >= self.pe32_opt_header.mImageBase
-        start_offset -= self.pe32_opt_header.mImageBase
-        end_offset -= self.pe32_opt_header.mImageBase
-
-        to_remove = range(start_offset, end_offset)
+        to_remove = range(start_rva, end_rva)
         l = len(self.relocations)
         self.relocations = [x for x in self.relocations if x not in to_remove]
         l2 = len(self.relocations)
 
         print(f'removed {l-l2} relocations')
 
+    def add_reloc(self, vaddr:int):
+        assert self.relocations is not None
 
-    def add_reloc(self, offset):
-        assert offset >= self.pe32_opt_header.mImageBase
-        offset -= self.pe32_opt_header.mImageBase
+        assert vaddr >= self.pe32_opt_header.mImageBase
+        rva = vaddr - self.pe32_opt_header.mImageBase
 
         l = len(self.relocations)
 
-        if offset not in self.relocations:
-            self.relocations.append(offset)
+        if rva not in self.relocations:
+            self.relocations.append(rva)
         else:
-            print(f"offset {offset} already in .reloc")
+            print(f"RVA {rva:08x} already in .reloc")
         l2 = len(self.relocations)
 
         print(f'added {l2-l} relocations')
@@ -518,7 +567,6 @@ class PeFile:
 
         # and update pe header.
         self.pe_header.mNumberOfSections = len(self.sections)
-        self.pe_header.to_buffer(self.exedata, self.pe_header_lfa)
 
         # and size of raw data
         size_of_init_data = 0
@@ -532,7 +580,7 @@ class PeFile:
 
         self.pe32_opt_header.mSizeOfImage = max(s.mVirtualAddress + self.get_section_virtual_size(s) for s in self.sections)
 
-        self.pe32_opt_header.to_buffer(self.exedata, self.pe32_opt_header_lfa)
+        self.flush_headers() # pe + optional
 
 
     def add_section(self, name_s:str, mCharacteristics:int, sectdata:bytes|bytearray):
@@ -593,107 +641,3 @@ if __name__ == "__main__":
 
     with open("GAME/lips.exe", 'rb') as f:
         pefile = PeFile.fromfile(f)
-
-    # x = 0
-    # x = 0xe20000e0
-    # for s in pefile.sections:
-    #     x |= s.mCharacteristics
-    # print(hex(x))
-
-
-
-    # x = 0x182
-    # x |= pefile.pe_header.mCharacteristics
-
-    # y = 1
-    # for _ in range(32):
-    #     if y & x:
-    #         print(hex(y))
-    #     y <<= 1
-            
-
-    # with open("testout.exe", "wb") as f:
-    #     pefile.tofile(f)
-
-    # mz_magic,  = struct.unpack_from('<H', exedata, 0)
-    # assert mz_magic == 0x5A4D # MZ
-
-    # e_lfanew,  = struct.unpack_from('<I', exedata, 0x3C)
-    # print(hex(e_lfanew))
-
-
-    # offset = e_lfanew
-
-    # # pe_magic, = struct.unpack_from("<I", exedata, e_lfanew)
-    # # assert pe_magic == 0x4550   # PE
-
-    # pe_header = PeHeader.from_buffer(exedata, offset)
-    # # pe_header = struct.unpack_from("<IHHIIIHH", exedata, e_lfanew)
-    # print(pe_header)
-
-
-    # offset += PeHeader.size()
-
-    # pe32_opt_header = Pe32OptionalHeader.from_buffer(exedata, offset)
-    # print(pe32_opt_header)
-
-    # offset += pe_header.mSizeOfOptionalHeader
-
-    # # print(exedata[offset:offset+10])
-    # print()
-
-
-    # reloc_s : SectionHeader|None = None
-
-    # for i in range(pe_header.mNumberOfSections):
-
-    #     s = SectionHeader.from_buffer(exedata, offset)
-    #     offset += SectionHeader.size()
-
-    #     print(s)
-    #     if s.mName == b'.reloc\x00\x00':
-    #         reloc_s = s
-
-    # assert reloc_s is not None
-    # print()
-    # print(reloc_s)
-
-
-    # relocations = list(parse_relocations(exedata, reloc_s.mPointerToRawData))
-
-    # orig_relocation_bin = exedata[reloc_s.mPointerToRawData:reloc_s.mPointerToRawData+reloc_s.mSizeOfRawData]
-
-    # # print(relocations[:100])
-    # # print(len(set(relocations)))
-    # # reloc_bin = exedata[reloc_s.mPointerToRawData: reloc_s.mPointerToRawData+reloc_s.mSizeOfRawData]
-    # # print(reloc_bin[:100])
-
-    # new_relocations_bin = encode_relocations(relocations, reloc_s.mSizeOfRawData)
-
-
-    # print(len(orig_relocation_bin))
-    # print(len(new_relocations_bin))
-
-    # relocations2 = list(parse_relocations(new_relocations_bin, 0))
-
-
-    # print(relocations == relocations2)
-
-
-    # # print(orig_relocation_bin[:-100])
-
-    # with open('reloc-orig.bin', 'wb') as f:
-    #     f.write(orig_relocation_bin)
-    # with open('reloc-new.bin', 'wb') as f:
-    #     f.write(new_relocations_bin)
-
-
-
-    # # for o in relocations:
-    # #     if o not in relocations2:
-    # #         print(hex(o))
-
-
-    # # so we need to try to fit in within the reloc siz.e. but also update the reloc directry entry
-
-
